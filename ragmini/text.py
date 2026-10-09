@@ -8,7 +8,7 @@ from collections import Counter
 import jieba
 
 TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_]+")
-SENTENCE_RE = re.compile(r"(?<=[。！？!?；;\.])\s*|\n+")
+SENTENCE_RE = re.compile(r"(?<=[。！？!?；;])\s*|(?<!\d)\.(?!\d)\s*|\n+")
 jieba.setLogLevel(logging.WARNING)
 
 

@@ -12,7 +12,7 @@ from ragmini.models import Chunk, SearchHit
 from ragmini.pipeline import RAGPipeline
 from ragmini.retrieval import HybridRetriever
 from ragmini.reranking import QwenTextReranker, RerankResult
-from ragmini.text import tokens
+from ragmini.text import split_sentences, tokens
 
 
 class FakeEmbedding:
@@ -67,6 +67,10 @@ class RAGTests(unittest.TestCase):
         self.assertIn("补贴", result)
         self.assertIn("rag", result)
         self.assertNotIn("差", result)
+
+    def test_sentence_split_preserves_decimal_numbers(self):
+        sentences = split_sentences("绩效系数为1.5。下一句。")
+        self.assertEqual(sentences, ["绩效系数为1.5。", "下一句。"])
 
     def test_chunker_never_crosses_sections_and_preserves_heading(self):
         pieces = TextChunker(chunk_size=12, overlap=2).split_with_metadata(
