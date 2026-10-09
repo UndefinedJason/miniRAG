@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections import Counter
 
+import jieba
 
-TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_]+")
+TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_]+")
 SENTENCE_RE = re.compile(r"(?<=[。！？!?；;\.])\s*|\n+")
+jieba.setLogLevel(logging.WARNING)
 
 
 def tokens(text: str) -> list[str]:
-    """Tokenize English words and individual CJK characters without dependencies."""
-    return [item.lower() for item in TOKEN_RE.findall(text)]
+    """Tokenize Chinese as words while preserving normalized Latin terms."""
+    result: list[str] = []
+    for item in jieba.lcut(text, cut_all=False):
+        result.extend(token.lower() for token in TOKEN_RE.findall(item))
+    return result
+
+
+def token_count(text: str) -> int:
+    return len(tokens(text))
 
 
 def stable_id(*parts: str) -> str:
@@ -28,4 +38,3 @@ def term_overlap(query: str, text: str) -> float:
     if not q:
         return 0.0
     return sum(min(count, d[token]) for token, count in q.items()) / sum(q.values())
-

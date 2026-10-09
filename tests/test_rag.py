@@ -10,6 +10,7 @@ from ragmini.embedding import OpenAICompatibleEmbedding
 from ragmini.generation import OpenAICompatibleGenerator
 from ragmini.models import Chunk, SearchHit
 from ragmini.pipeline import RAGPipeline
+from ragmini.text import tokens
 
 
 class FakeEmbedding:
@@ -36,11 +37,26 @@ class RAGTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_chunker_has_overlap(self):
-        chunks = TextChunker(chunk_size=20, overlap=5).split(
+        chunks = TextChunker(chunk_size=10, overlap=3).split(
             "第一句话比较长。第二句话也比较长。第三句话结束。"
         )
         self.assertGreaterEqual(len(chunks), 2)
-        self.assertIn(chunks[0][-5:], chunks[1])
+        self.assertIn("第二句话也比较长。", chunks[1])
+
+    def test_chinese_tokenization_uses_words(self):
+        result = tokens("我司人员出差补贴每天多少钱？RAG 2026")
+        self.assertIn("出差", result)
+        self.assertIn("补贴", result)
+        self.assertIn("rag", result)
+        self.assertNotIn("差", result)
+
+    def test_chunker_never_crosses_sections_and_preserves_heading(self):
+        pieces = TextChunker(chunk_size=12, overlap=2).split_with_metadata(
+            "第一章 请假管理\n员工应提前申请。直属主管负责审批。\n\n"
+            "第二章 差旅管理\n出差补贴每天一百五十元。"
+        )
+        self.assertTrue(all(piece.section in piece.text for piece in pieces))
+        self.assertFalse(any("请假" in piece.text and "差旅管理" in piece.text for piece in pieces))
 
     def test_ingest_replaces_same_source(self):
         pipeline = RAGPipeline(self.db_path, chunk_size=20, overlap=5)

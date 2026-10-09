@@ -17,8 +17,8 @@ class RAGPipeline:
     def __init__(
         self,
         db_path: str | Path = "data/rag.db",
-        chunk_size: int = 500,
-        overlap: int = 80,
+        chunk_size: int = 180,
+        overlap: int = 30,
         generator: Generator | None = None,
         embedder: EmbeddingModel | None = None,
     ) -> None:
@@ -31,7 +31,8 @@ class RAGPipeline:
     def ingest(self, text: str, source: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         document_id = stable_id(source)
         base_metadata = {**(metadata or {}), "source": source}
-        contents = self.chunker.split(text)
+        pieces = self.chunker.split_with_metadata(text)
+        contents = [piece.text for piece in pieces]
         embeddings = self.embedder.embed_many(contents)
         if embeddings:
             self.store.ensure_embedding_config(self.embedder.model_id, len(embeddings[0]))
@@ -41,10 +42,12 @@ class RAGPipeline:
                 document_id=document_id,
                 text=content,
                 position=position,
-                metadata=base_metadata,
+                metadata={**base_metadata, "section": piece.section},
                 embedding=embedding,
             )
-            for position, (content, embedding) in enumerate(zip(contents, embeddings))
+            for position, (piece, content, embedding) in enumerate(
+                zip(pieces, contents, embeddings)
+            )
         ]
         count = self.store.replace_document(document_id, chunks)
         return {"document_id": document_id, "chunks": count, "source": source}
