@@ -10,6 +10,7 @@ from .embedding import EmbeddingModel, HashEmbedding
 from .generation import ExtractiveGenerator, Generator
 from .models import Chunk, RAGResponse
 from .retrieval import HybridRetriever
+from .reranking import Reranker, reranker_from_env
 from .store import SQLiteChunkStore
 from .text import stable_id
 
@@ -22,12 +23,19 @@ class RAGPipeline:
         overlap: int = 30,
         generator: Generator | None = None,
         embedder: EmbeddingModel | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self.store = SQLiteChunkStore(db_path)
         self.chunker = TextChunker(chunk_size, overlap)
         self.embedder = embedder or HashEmbedding()
+        configured_reranker = reranker if reranker is not None else reranker_from_env()
+        minimum = os.getenv("RERANK_MIN_SCORE")
+        self.retrieval_candidates = int(os.getenv("RERANK_CANDIDATES", "20"))
         self.retriever = HybridRetriever(
-            self.embedder, mmr_lambda=float(os.getenv("MMR_LAMBDA", "0.8"))
+            self.embedder,
+            mmr_lambda=float(os.getenv("MMR_LAMBDA", "0.8")),
+            reranker=configured_reranker,
+            min_rerank_score=float(minimum) if minimum else None,
         )
         self.generator = generator or ExtractiveGenerator()
 
@@ -72,7 +80,11 @@ class RAGPipeline:
             self.store.ensure_embedding_config(self.embedder.model_id, len(query_vector))
         embedded_at = time.perf_counter()
         retrieval = self.retriever.search(
-            question, chunks, top_k=top_k, query_vector=query_vector
+            question,
+            chunks,
+            top_k=top_k,
+            candidates=self.retrieval_candidates,
+            query_vector=query_vector,
         )
         hits = retrieval.hits
         retrieved_at = time.perf_counter()

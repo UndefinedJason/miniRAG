@@ -6,6 +6,7 @@ from collections import Counter
 
 from .embedding import EmbeddingModel, cosine
 from .models import Chunk, RetrievalResult, SearchHit
+from .reranking import Reranker
 from .text import tokens
 
 
@@ -40,10 +41,14 @@ class HybridRetriever:
         embedder: EmbeddingModel,
         rrf_k: int = 60,
         mmr_lambda: float = 0.8,
+        reranker: Reranker | None = None,
+        min_rerank_score: float | None = None,
     ) -> None:
         self.embedder = embedder
         self.rrf_k = rrf_k
         self.mmr_lambda = mmr_lambda
+        self.reranker = reranker
+        self.min_rerank_score = min_rerank_score
         if not 0 <= mmr_lambda <= 1:
             raise ValueError("mmr_lambda must be between 0 and 1")
 
@@ -86,7 +91,43 @@ class HybridRetriever:
             for rank, chunk_id in enumerate(candidate_ids, start=1)
         ]
         rrf_at = time.perf_counter()
-        self._set_rrf_relevance(hits)
+        reranker_info: dict = {
+            "enabled": self.reranker is not None,
+            "degraded": False,
+            "strategy": "rrf_fallback",
+        }
+        rerank_ids = candidate_ids
+        if self.reranker is not None:
+            try:
+                rerank_result = self.reranker.rerank(query, hits)
+                rerank_ids = rerank_result.ranking
+                positions = {chunk_id: rank for rank, chunk_id in enumerate(rerank_ids, start=1)}
+                for hit in hits:
+                    hit.rerank_score = rerank_result.scores[hit.chunk.id]
+                    hit.rerank_rank = positions[hit.chunk.id]
+                    hit.mmr_relevance = hit.rerank_score
+                hits.sort(key=lambda hit: (hit.rerank_rank or len(hits) + 1, hit.rrf_rank))
+                if self.min_rerank_score is not None:
+                    filtered = [hit for hit in hits if (hit.rerank_score or 0) >= self.min_rerank_score]
+                    hits = filtered or hits[:1]
+                reranker_info = {
+                    "enabled": True,
+                    "degraded": False,
+                    "strategy": "qwen",
+                    "model": rerank_result.model,
+                    "usage": rerank_result.usage,
+                }
+            except Exception as exc:
+                self._set_rrf_relevance(hits)
+                reranker_info = {
+                    "enabled": True,
+                    "degraded": True,
+                    "strategy": "rrf_fallback",
+                    "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                }
+        else:
+            self._set_rrf_relevance(hits)
+        reranked_at = time.perf_counter()
         selected = self._mmr(hits, top_k)
         finished = time.perf_counter()
         return RetrievalResult(
@@ -95,16 +136,16 @@ class HybridRetriever:
                 "dense": [chunk.id for chunk in dense_rank],
                 "bm25": [chunk.id for chunk in sparse_rank],
                 "rrf": candidate_ids,
-                "rerank": candidate_ids,
+                "rerank": rerank_ids,
                 "mmr": [hit.chunk.id for hit in selected],
             },
             timings={
                 "initial_retrieval_ms": round((initial_at - started) * 1000, 2),
                 "rrf_ms": round((rrf_at - initial_at) * 1000, 2),
-                "rerank_ms": 0.0,
-                "mmr_ms": round((finished - rrf_at) * 1000, 2),
+                "rerank_ms": round((reranked_at - rrf_at) * 1000, 2),
+                "mmr_ms": round((finished - reranked_at) * 1000, 2),
             },
-            reranker={"enabled": False, "degraded": False, "strategy": "rrf_fallback"},
+            reranker=reranker_info,
         )
 
     @staticmethod

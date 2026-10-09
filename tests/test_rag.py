@@ -11,6 +11,7 @@ from ragmini.generation import OpenAICompatibleGenerator
 from ragmini.models import Chunk, SearchHit
 from ragmini.pipeline import RAGPipeline
 from ragmini.retrieval import HybridRetriever
+from ragmini.reranking import QwenTextReranker, RerankResult
 from ragmini.text import tokens
 
 
@@ -27,6 +28,22 @@ class FakeEmbedding:
 class FakeLLM:
     def generate(self, question, hits):
         return f"模型回答：{hits[0].chunk.text} [1]"
+
+
+class FakeReranker:
+    def rerank(self, query, hits):
+        ranking = [hit.chunk.id for hit in reversed(hits)]
+        return RerankResult(
+            scores={chunk_id: 0.9 - index * 0.1 for index, chunk_id in enumerate(ranking)},
+            ranking=ranking,
+            usage={"total_tokens": 42},
+            model="fake-reranker",
+        )
+
+
+class BrokenReranker:
+    def rerank(self, query, hits):
+        raise RuntimeError("temporary failure")
 
 
 class RAGTests(unittest.TestCase):
@@ -118,6 +135,55 @@ class RAGTests(unittest.TestCase):
         )
         by_id = {hit.chunk.id: hit for hit in result.hits}
         self.assertAlmostEqual(by_id["dense"].rrf_score, by_id["sparse"].rrf_score)
+
+    def test_remote_reranker_scores_feed_mmr(self):
+        chunks = [
+            Chunk("a", "d", "RAG 检索", 0, {}, [1.0, 0.0, 0.0]),
+            Chunk("b", "d", "RAG 生成", 1, {}, [0.8, 0.2, 0.0]),
+        ]
+        result = HybridRetriever(FakeEmbedding(), reranker=FakeReranker()).search(
+            "RAG", chunks, top_k=2
+        )
+        self.assertEqual(result.hits[0].chunk.id, result.rankings["rerank"][0])
+        self.assertEqual(result.hits[0].rerank_score, 0.9)
+        self.assertFalse(result.reranker["degraded"])
+
+    def test_reranker_failure_degrades_to_rrf(self):
+        chunks = [Chunk("a", "d", "RAG", 0, {}, [1.0, 0.0, 0.0])]
+        result = HybridRetriever(FakeEmbedding(), reranker=BrokenReranker()).search(
+            "RAG", chunks, top_k=1
+        )
+        self.assertTrue(result.reranker["degraded"])
+        self.assertEqual(result.hits[0].mmr_relevance, 1.0)
+
+    @patch("urllib.request.urlopen")
+    def test_qwen_reranker_protocol_and_index_mapping(self, urlopen):
+        urlopen.return_value = io.BytesIO(
+            json.dumps(
+                {
+                    "output": {
+                        "results": [
+                            {"index": 1, "relevance_score": 0.9},
+                            {"index": 0, "relevance_score": 0.2},
+                        ]
+                    },
+                    "usage": {"total_tokens": 12},
+                }
+            ).encode()
+        )
+        reranker = QwenTextReranker(
+            base_url="https://example.test/rerank", api_key="test-key"
+        )
+        hits = [
+            SearchHit(Chunk("a", "d", "A", 0, {}, [1.0]), 0.0),
+            SearchHit(Chunk("b", "d", "B", 1, {}, [1.0]), 0.0),
+        ]
+        result = reranker.rerank("question", hits)
+        self.assertEqual(result.ranking, ["b", "a"])
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "qwen3.7-text-rerank")
+        self.assertEqual(payload["input"]["documents"], ["A", "B"])
 
     def test_embedding_model_mismatch_is_rejected(self):
         pipeline = RAGPipeline(self.db_path)
