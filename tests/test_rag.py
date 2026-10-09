@@ -10,6 +10,7 @@ from ragmini.embedding import OpenAICompatibleEmbedding
 from ragmini.generation import OpenAICompatibleGenerator
 from ragmini.models import Chunk, SearchHit
 from ragmini.pipeline import RAGPipeline
+from ragmini.retrieval import HybridRetriever
 from ragmini.text import tokens
 
 
@@ -91,6 +92,32 @@ class RAGTests(unittest.TestCase):
         response = pipeline.ask("RAG 是什么？")
         self.assertIn("模型回答", response.answer)
         self.assertEqual(response.citations[0]["source"], "rag.md")
+
+    def test_retrieval_exposes_rrf_and_mmr_stages(self):
+        embedder = FakeEmbedding()
+        chunks = [
+            Chunk("a", "d", "RAG 检索", 0, {}, [1.0, 0.0, 0.0]),
+            Chunk("b", "d", "RAG 生成", 1, {}, [0.9, 0.1, 0.0]),
+            Chunk("c", "d", "天气预报", 2, {}, [0.0, 1.0, 0.0]),
+        ]
+        result = HybridRetriever(embedder).search("RAG", chunks, top_k=2)
+        first = result.hits[0]
+        self.assertEqual(first.rrf_rank, 1)
+        self.assertEqual(first.final_rank, 1)
+        self.assertEqual(first.mmr_redundancy, 0.0)
+        self.assertIsNone(first.rerank_score)
+        self.assertEqual(result.rankings["mmr"], [hit.chunk.id for hit in result.hits])
+
+    def test_rrf_uses_ranks_not_raw_score_scales(self):
+        chunks = [
+            Chunk("dense", "d", "无关键词", 0, {}, [1.0, 0.0, 0.0]),
+            Chunk("sparse", "d", "目标词", 1, {}, [0.0, 1.0, 0.0]),
+        ]
+        result = HybridRetriever(FakeEmbedding()).search(
+            "目标词", chunks, top_k=2, query_vector=[1.0, 0.0, 0.0]
+        )
+        by_id = {hit.chunk.id: hit for hit in result.hits}
+        self.assertAlmostEqual(by_id["dense"].rrf_score, by_id["sparse"].rrf_score)
 
     def test_embedding_model_mismatch_is_rejected(self):
         pipeline = RAGPipeline(self.db_path)
