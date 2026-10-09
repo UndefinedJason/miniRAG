@@ -1,189 +1,204 @@
-# RAG Mini：麻雀虽小，五脏俱全
+# RAG Mini：可解释的中文混合检索
 
-这是一个面向学习和面试的最小 RAG 项目。它只有少量 Python 代码，默认零第三方依赖即可运行，但包含一条完整链路：
+这是一个面向学习和面试的最小 RAG 项目，保留了完整、可复算的检索链路：
 
 ```text
-文档 → 句子感知切分 → 向量化 → SQLite 持久化
-                              ↓
-问题 → 稠密召回 + BM25 → RRF 融合 → 轻量重排 + MMR → 上下文 → 生成 → 引用/Trace
+文档 → 章节/段落/句子切分 → Qwen Embedding → SQLite
+问题 → Dense + 中文BM25 → RRF → Qwen Rerank → MMR → DeepSeek → 引用/Trace
 ```
 
-## 1. 快速开始
+项目重点不是堆框架，而是明确区分每个阶段的分数、排名、耗时和失败降级行为。
+
+## 1. 安装与快速开始
 
 要求 Python 3.9+。
 
 ```bash
-python -m ragmini.cli --db data/demo.db ingest examples/knowledge.md
-python -m ragmini.cli --db data/demo.db ask "混合检索有什么好处？" --top-k 3
-python -m examples.evaluate
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
 ```
 
-默认使用离线抽取式生成器，方便无密钥测试。要运行真正的 RAG，推荐直接使用下面的“双模型模式”。输出包含回答、引用原文和检索各阶段分数。
+离线模式不需要 API Key：
+
+```bash
+python3 -m ragmini.cli --db data/demo.db ingest examples/knowledge.md
+python3 -m ragmini.cli --db data/demo.db ask "混合检索有什么好处？" --top-k 3
+```
 
 ### 使用 `.env` 持久保存配置
-
-项目启动时会自动读取当前目录的 `.env`，且不会覆盖终端中已经存在的同名环境变量。先复制示例配置：
 
 ```bash
 cp .env.example .env
 ```
 
-然后只需在 `.env` 中填写 API Key。`.env` 已加入 `.gitignore`，不要把真实密钥提交或发送给他人。示例文件默认配置为 DeepSeek 生成加本地 Hash Embedding；之后可以直接运行：
+程序启动时自动读取当前目录的 `.env`，但不会覆盖终端中已经存在的同名环境变量。`.env` 已加入 `.gitignore`，不要把真实 Key 提交或发送给他人。
 
-```bash
-python -m ragmini.cli ingest examples/knowledge.md
-python -m ragmini.cli ask "什么是 RAG？" --top-k 3
+DeepSeek 生成 + Qwen Embedding 示例：
+
+```dotenv
+OPENAI_API_KEY=你的DeepSeekKey
+OPENAI_BASE_URL=https://api.deepseek.com
+RAG_MODEL=deepseek-flash
+RAG_GENERATOR=openai
+
+EMBEDDING_API_KEY=你的百炼Key
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_MODEL=qwen3.7-text-embedding-flash
+EMBEDDING_BATCH_SIZE=20
+RAG_EMBEDDING=openai
+
+RAG_DB=data/qwen37-structured.db
 ```
 
-### 使用真实 Embedding + 真实 LLM
-
-实现遵循 OpenAI-compatible API：Embedding 请求发送到 `/embeddings`，生成请求发送到 `/chat/completions`。OpenAI 默认配置如下：
+配置完成后重新建立索引；切块方式或 embedding 模型改变时不要复用旧数据库：
 
 ```bash
-export OPENAI_API_KEY='your-key'
-export OPENAI_BASE_URL='https://api.openai.com/v1'
-export EMBEDDING_MODEL='text-embedding-3-small'
-export RAG_MODEL='gpt-4.1-mini'
+python3 -m ragmini.cli ingest \
+  examples/knowledge.md \
+  examples/company_management_policy.txt
 
-# 必须用真实 embedding 重新建一个索引；不要混用旧的 hash 向量库
-python -m ragmini.cli \
-  --db data/real-model.db \
-  --embedding openai \
-  ingest examples/knowledge.md
-
-python -m ragmini.cli \
-  --db data/real-model.db \
-  --embedding openai \
-  ask "混合检索有什么好处？" \
-  --generator openai \
-  --top-k 3
+python3 -m ragmini.cli ask "国内出差每天补贴多少钱？" --top-k 3
 ```
 
-如果 embedding 和生成模型来自不同的兼容服务，可以分别设置：
+## 2. 接入 Qwen3.7 Text Rerank
 
-```bash
-export EMBEDDING_BASE_URL='https://embedding-provider.example/v1'
-export EMBEDDING_API_KEY='embedding-key'
-export EMBEDDING_MODEL='provider-embedding-model'
+Embedding 将问题和文档分别编码后比较向量；cross-encoder reranker 会同时阅读问题与候选片段，更适合判断片段是否真正回答问题。
 
-export OPENAI_BASE_URL='https://llm-provider.example/v1'
-export OPENAI_API_KEY='llm-key'
-export RAG_MODEL='provider-chat-model'
+从百炼控制台复制 Workspace ID，把下面配置加入 `.env`：
+
+```dotenv
+RAG_RERANKER=qwen
+RERANK_BASE_URL=https://你的WorkspaceId.cn-beijing.maas.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RERANK_MODEL=qwen3.7-text-rerank
+RERANK_CANDIDATES=20
+RERANK_TIMEOUT=30
+RERANK_INSTRUCT=Given a user question, retrieve passages that directly answer the question.
+MMR_LAMBDA=0.8
 ```
 
-程序会在 SQLite 中记录 embedding 服务、模型名和向量维度。查询时配置不一致会立即报错，避免不同模型的向量被静默混用。
+默认复用 `EMBEDDING_API_KEY`；如需单独的重排 Key，可设置 `RERANK_API_KEY`。
 
-启动 HTTP API：
+当重排接口超时或报错时，系统会自动使用本次候选的归一化 RRF 分数继续 MMR，并在 trace 中标记：
+
+```json
+{
+  "reranker": {
+    "enabled": true,
+    "degraded": true,
+    "strategy": "rrf_fallback",
+    "error": "..."
+  }
+}
+```
+
+`RERANK_MIN_SCORE` 是可选的请求内阈值，默认不设置。Qwen 返回的是本次请求内的相对相关性，不应在没有标注集校准时把它当成跨请求概率。
+
+## 3. 如何阅读分数
+
+每个最终命中项包含：
+
+```json
+{
+  "dense": {"score": 0.51, "rank": 2},
+  "bm25": {"score": 6.94, "rank": 1},
+  "rrf": {"score": 0.0325, "rank": 1},
+  "rerank": {"score": 0.93, "rank": 1},
+  "mmr": {
+    "relevance": 0.93,
+    "redundancy": 0.18,
+    "lambda": 0.8,
+    "score": 0.708,
+    "rank": 1
+  }
+}
+```
+
+- `dense.score`：Qwen 向量余弦相似度，只在同一模型、同一查询内解释。
+- `bm25.score`：中文词级关键词相关性，与 dense 不同尺度，不能直接相加。
+- `rrf.score`：`Σ 1/(60 + rank)`，融合 Dense 与 BM25 排名，不是概率。
+- `rerank.score`：cross-encoder 对本批候选的相对相关性；未启用或降级时为 `null`。
+- `mmr.score`：`0.8 × relevance - 0.2 × redundancy`，兼顾相关性与结果多样性。
+
+Trace 会分别输出 query embedding、初召回、RRF、rerank、MMR 和生成耗时，并保存每个阶段的 chunk 排名。
+
+## 4. 中文切块与检索
+
+- `jieba` 精确模式将中文切成词语，而不是单汉字。
+- Markdown 标题、`第X章`、`附件X` 会创建独立 section，chunk 不跨 section。
+- section 内按段落、句子累计，默认目标 180 个词级 token、重叠 30 个 token。
+- 重叠复制完整尾句；只有单句超长时才回退硬切。
+- section 标题写入 chunk 文本和 metadata，帮助 embedding 保留主题。
+
+## 5. 分阶段评估
+
+离线评估不会调用付费 API：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python3 -m examples.evaluate --mode offline --top-k 3
+```
+
+使用 `.env` 中的真实 Embedding 和 LLM：
+
+```bash
+python3 -m examples.evaluate --mode configured --top-k 3
+```
+
+12 条 golden cases 覆盖精确数字、同义改写、出差补贴/餐费补贴硬负例和不可回答问题。相关性标注使用 `source + passage contains + 0~3级 relevance`，避免同一文件的任意 chunk 都被判为命中。
+
+报告分别展示 Dense、BM25、RRF、rerank、MMR 的：
+
+- Precision@K
+- Recall@K
+- MRR
+- nDCG@K
+- 答案关键词召回率
+- 可回答性准确率与拒答准确率
+
+## 6. HTTP API
+
+```bash
 pip install -e '.[api,dev]'
 uvicorn ragmini.api:app --reload
 ```
 
-访问 `http://127.0.0.1:8000/docs` 查看 Swagger。主要接口：
+访问 `http://127.0.0.1:8000/docs`：
 
-- `POST /documents`：写入文本及元数据；同一 `source` 会幂等替换。
-- `POST /query`：检索并生成带引用的回答。
-- `GET /health`：健康状态和当前 chunk 数。
+- `POST /documents`：写入文本及元数据；相同 `source` 幂等替换。
+- `POST /query`：检索并生成带引用、分阶段 trace 的回答。
+- `GET /health`：健康状态和 chunk 数。
 
-仅把生成阶段切换为 OpenAI-compatible 模型（仍使用演示用 Hash Embedding）：
-
-```bash
-export OPENAI_API_KEY='your-key'
-export OPENAI_BASE_URL='https://api.openai.com/v1'  # 可替换为兼容服务
-export RAG_MODEL='gpt-4.1-mini'
-python -m ragmini.cli --db data/demo.db ask "什么是 RAG？" --generator openai
-```
-
-API 服务同时设置 `RAG_EMBEDDING=openai` 和 `RAG_GENERATOR=openai` 即可启用双模型模式。建议使用全新的 `RAG_DB` 路径：
-
-```bash
-export RAG_EMBEDDING=openai
-export RAG_GENERATOR=openai
-export RAG_DB=data/real-model.db
-uvicorn ragmini.api:app --reload
-```
-
-## 2. 项目结构
+## 7. 项目结构
 
 ```text
 ragmini/
-  chunking.py     # 句子边界、chunk size、overlap
-  embedding.py    # Hash 基线 + 真实 OpenAI-compatible Embedding + cosine
-  store.py        # SQLite 文档库/向量库
-  retrieval.py    # Dense + BM25 + RRF + rerank + MMR
-  generation.py   # Prompt、上下文预算、离线/OpenAI-compatible 生成
-  pipeline.py     # ingestion 与 query 编排、引用、耗时 trace
-  evaluation.py   # Recall@K、MRR、答案关键词分数
-  api.py          # FastAPI 接口
+  chunking.py     # 章节/段落/句子切块与完整句重叠
+  text.py         # jieba中文分词、英文/数字规范化
+  embedding.py    # Hash基线与OpenAI-compatible Embedding
+  retrieval.py    # Dense、BM25、RRF、rerank、MMR
+  reranking.py    # Qwen3.7 Text Rerank与协议校验
+  store.py        # SQLite文档库/向量库
+  generation.py   # Grounded prompt与生成模型
+  pipeline.py     # ingestion、query、引用与trace编排
+  evaluation.py   # 分阶段Precision/Recall/MRR/nDCG
+  api.py          # FastAPI接口
   cli.py          # 命令行入口
-tests/             # 切分、幂等、端到端、拒答测试
+tests/             # 分词、切块、协议、降级、指标与端到端测试
 ```
 
-## 3. 设计取舍（面试重点）
-
-### 为什么要切分和重叠？
-
-整篇文档直接向量化会稀释主题，也浪费 LLM 上下文。小块召回更精确，但容易切断语义。本项目按句子边界优先切分，超长句硬切，并把上一块尾部带入下一块。生产环境应按目标模型 tokenizer 计数，并基于标题层级、段落或语义做结构化切分。
-
-### 稠密检索与 BM25 有什么差异？
-
-- 稠密检索适合语义相近但字面不同的表达。
-- BM25 对产品名、错误码、人名等精确关键词更可靠。
-- 本项目分别生成两个排名，用 Reciprocal Rank Fusion（RRF）融合。RRF 不要求两种分数同尺度，比直接加权分数稳健。
-
-为了零依赖，本地 dense embedding 使用 feature hashing，它只能近似词面/短语相似，并不具备真正神经向量的语义能力。生产时只需替换 `HashEmbedding.embed()`，可接入 BGE、E5、OpenAI embeddings 等；存储层则可替换为 pgvector、Milvus、Qdrant、Elasticsearch/OpenSearch。
-
-### 为什么还需要 rerank 和 MMR？
-
-首阶段召回追求 Recall，候选较多；reranker 追求前几名 Precision。这里用 query-term overlap 和 dense score 实现可解释的轻量精排。生产常用 cross-encoder 或专用 rerank API。MMR 会惩罚与已选 chunk 过于相似的候选，减少相邻重叠块挤占上下文。
-
-### 如何减少幻觉？
-
-- system prompt 限定只能依据上下文；证据不足时拒答。
-- 返回 chunk 级引用，答案可追溯。
-- `temperature=0` 降低随机性，但不能保证事实正确。
-- 真正上线还要做检索置信度阈值、引用一致性检查、敏感内容过滤、prompt injection 隔离和权限过滤（ACL 必须在召回前执行）。
-
-### 如何评估？
-
-不要只评最终答案，应分层定位问题：
-
-| 层次 | 常用指标 | 本项目 |
-|---|---|---|
-| 索引/数据 | 覆盖率、重复率、解析失败率、新鲜度 | 幂等覆盖、chunk count |
-| 检索 | Recall@K、MRR、nDCG | Recall@K、MRR |
-| 生成 | 正确性、faithfulness、引用准确率、拒答率 | 关键词分数、引用、拒答测试 |
-| 系统 | P50/P95 延迟、吞吐、token/费用、缓存命中 | retrieval/generation/total trace |
-
-`python -m examples.evaluate` 会运行一个最小离线 golden set。真实项目需要人工标注问题、相关文档及参考答案；LLM-as-a-judge 适合扩展规模，但应抽样人工校准，避免位置偏差和自我偏好。
-
-### RAG 常见故障如何定位？
-
-1. 正确 chunk 没进候选：检查解析、切分、embedding、召回与 ACL。
-2. 正确 chunk 召回但排名低：调 hybrid 权重、候选数或 reranker。
-3. 证据正确但回答错：检查 prompt、上下文顺序、模型能力与引用约束。
-4. 回答旧信息：做增量索引、版本字段、删除传播和 freshness 监控。
-5. 延迟或成本高：缓存 query/embedding、批量 embedding、ANN 索引、缩小候选及上下文。
-
-## 4. 生产化演进路线
-
-这个实现刻意把接口分开，便于逐层替换：
-
-1. `HashEmbedding` → BGE/E5/OpenAI embedding，并记录模型版本和向量维度。
-2. SQLite 全量扫描 → 支持 HNSW/IVF 的向量数据库；数据量小于数十万时先测再选型。
-3. 轻量 rerank → cross-encoder，并使用离线集调候选数与阈值。
-4. txt/md → PDF、HTML、Office 解析，保留标题、页码、表格和 ACL 元数据。
-5. 单轮问题 → query rewrite、多轮对话去指代；谨慎使用 HyDE，避免引入错误假设。
-6. 单实例 → 异步 ingestion、队列、批处理、缓存、Tracing、限流和灰度评估。
-
-## 5. 测试
+## 8. 测试
 
 ```bash
-python -m unittest discover -s tests -v
-# 安装 dev 依赖后也可运行：pytest -q
+python3 -m unittest discover -s tests -v
+# 安装dev依赖后也可运行
+pytest -q
 ```
 
-测试覆盖 chunk overlap、同源幂等更新、端到端检索/引用和证据不足拒答。
+测试包含中文词级分词、章节隔离、完整句 overlap、索引模型一致性、RRF、Qwen 请求映射、失败降级、MMR、评估指标和端到端引用。
+
+## 9. 边界与生产化方向
+
+- SQLite 当前对向量全量扫描，适合学习和小数据；规模扩大后替换为 pgvector、Milvus 或 Qdrant。
+- Qwen rerank 分数只能在当前请求内比较；固定阈值必须使用业务标注集校准。
+- 生成答案仍需结合引用一致性检查、ACL、Prompt Injection 隔离、敏感内容过滤和人工抽检。
+- 真实评估应持续扩充 hard negatives，并分别观察检索、重排和生成，不能只看最终答案。
